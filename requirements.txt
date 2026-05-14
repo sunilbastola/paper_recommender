@@ -1,0 +1,4 @@
+huggingface-transformers
+pytorch
+numpy
+pandas
