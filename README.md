@@ -1,2 +1,15 @@
 # paper_recommender
-Using ArXiv datasets to recommend the paper based on the requirements. Uses advanced NLP and similarity calculation for the ArXIV project recommendation dataset.
+
+Recommends relevant arXiv papers using NLP and similarity calculations on the arXiv metadata snapshot.
+
+Project structure:
+
+paper_recommender/
+├── .venv
+├── .gitignore
+├── arxiv-metadata-oai-snapshot.json
+├── main.ipynb
+├── README.md
+└── requirements.txt
+
+Usage: open main.ipynb to run the recommendation pipeline.
