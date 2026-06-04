@@ -1,16 +1,18 @@
 import json
+import os
 import re
 import time
 from pathlib import Path
 
 import numpy as np  # must be imported before torch
-import os
+import pandas as pd
+import pdfplumber
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
-import requests
-import pandas as pd
-import pdfplumber
+
+import kagglehub
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
@@ -37,8 +39,6 @@ def _preprocess(text: str) -> str:
 
 def load_dataset():
     """Load arXiv papers and build all models needed by the 5 goals."""
-    import kagglehub
-
     # Download dataset if not already cached
     if not DATA_FILE.exists():
         print("Downloading arXiv dataset from Kaggle...")
