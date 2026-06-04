@@ -20,7 +20,7 @@ from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 
 MAX_PAPERS = 8000
-DATA_FILE = Path("/Users/jocelyn/.cache/kagglehub/datasets/Cornell-University/arxiv/versions/288/arxiv-metadata-oai-snapshot.json")
+DATA_FILE = Path(os.environ.get("ARXIV_DATA_FILE", "/root/.cache/kagglehub/datasets/Cornell-University/arxiv/versions/288/arxiv-metadata-oai-snapshot.json"))
 
 STOPWORDS = {
     "a","an","and","are","as","at","be","by","for","from","has","in","is",
