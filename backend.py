@@ -194,19 +194,40 @@ def generate_report(
     # Clear all fields — only populate what was requested
     result = {"reply": "", "summary": "", "gaps": "", "recs": ""}
 
-    rec = recommend_papers(
-        query, df, tfidf_vec, tfidf_matrix, terms,
-        classifier, embed_model, retriever,
-        top_k=3 if paper_text else 4,
-    )
-
+    target_category = None
     if paper_text:
         analysis = analyse_paper(paper_text, classifier, tfidf_vec, terms)
+        target_category = analysis["domain"]
         context_block = (
             f'Uploaded paper: "{paper_name}"\n'
             f'Domain: {analysis["domain"]}\n'
             f'Keywords: {", ".join(analysis["keywords"])}\n\n'
             f'Content:\n{paper_text}'
+        )
+    else:
+        context_block = ""
+
+    rec = recommend_papers(
+        query,
+        df,
+        tfidf_vec,
+        tfidf_matrix,
+        terms,
+        classifier,
+        embed_model,
+        retriever,
+        top_k=3 if paper_text else 4,
+        target_category=target_category,
+    )
+
+    if not paper_text:
+        context_block = (
+            "No paper uploaded. Using retrieved arXiv papers:\n\n"
+            + "\n\n---\n\n".join(
+                f"Paper ID: {r['id']}\nTitle: {r['title']}\n"
+                f"Keywords: {', '.join(r['keywords'])}\nAbstract: {r['abstract'][:600]}"
+                for _, r in rec["advanced_recommendations"].iterrows()
+            )
         )
     else:
         context_block = (
@@ -405,28 +426,41 @@ def recommend_papers(
     embed_model: SentenceTransformer,
     retriever: NearestNeighbors,
     top_k: int = 5,
+    target_category: str | None = None,
 ) -> dict:
     """
     Recommend papers using:
     - Basic: TF-IDF cosine similarity (keyword match)
     - Advanced: Dense embedding retrieval + RAG instruction prompt
-    Basic output feeds into advanced — TF-IDF candidate IDs are injected
-    into the enriched context so the LLM can cross-reference both methods.
+    If a target category is provided, restrict retrieval to that category.
     """
 
     query_clean = _preprocess(query)
 
-    # TF-IDF candidate retrieval: exact keyword matching in the paper corpus.
+    # Restrict to category if the uploaded paper has one.
+    if target_category:
+        category_mask = df["primary_category"] == target_category
+        filtered_df = df[category_mask]
+        filtered_tfidf_matrix = tfidf_matrix[category_mask.values]
+        if filtered_df.empty:
+            filtered_df = df
+            filtered_tfidf_matrix = tfidf_matrix
+            target_category = None
+    else:
+        filtered_df = df
+        filtered_tfidf_matrix = tfidf_matrix
+
+    # TF-IDF candidate retrieval: exact keyword matching in the filtered corpus.
     query_vec = tfidf_vec.transform([query_clean])
-    if query_vec.nnz == 0:
-        basic_recs = df.iloc[[]][["id", "title", "categories", "keywords"]].copy()
+    if query_vec.nnz == 0 or filtered_df.empty:
+        basic_recs = filtered_df.iloc[[]][["id", "title", "categories", "keywords"]].copy()
         basic_recs["similarity"] = np.array([], dtype=float)
         tfidf_ids = []
         tfidf_scores = {}
     else:
-        scores = cosine_similarity(query_vec, tfidf_matrix).ravel()
+        scores = cosine_similarity(query_vec, filtered_tfidf_matrix).ravel()
         top_idx = scores.argsort()[-top_k:][::-1]
-        basic_recs = df.iloc[top_idx][["id", "title", "categories", "keywords"]].copy()
+        basic_recs = filtered_df.iloc[top_idx][["id", "title", "categories", "keywords"]].copy()
         basic_recs["similarity"] = scores[top_idx]
         tfidf_ids = basic_recs["id"].tolist()
         tfidf_scores = dict(zip(tfidf_ids, basic_recs["similarity"].tolist()))
@@ -438,10 +472,12 @@ def recommend_papers(
     )
     dists, idxs = retriever.kneighbors(qvec, n_neighbors=top_k)
     embed_results = df.iloc[idxs[0]].copy()
-    embed_results["similarity"] = 1 - dists[0]
+    if target_category:
+        embed_results = embed_results[embed_results["primary_category"] == target_category]
+    embed_results["similarity"] = 1 - dists[0][: len(embed_results)]
     embed_scores = dict(zip(embed_results["id"].tolist(), embed_results["similarity"].tolist()))
     embed_results = embed_results[
-        ["id", "title", "authors", "categories", "keywords", "similarity", "abstract"]
+        ["id", "title", "authors", "categories", "keywords", "similarity", "abstract", "primary_category"]
     ]
 
     # Combine both candidate sets to reduce cases where one retriever misses relevant papers.
