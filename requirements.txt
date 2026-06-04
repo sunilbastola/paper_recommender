@@ -9,3 +9,4 @@ tqdm
 kagglehub
 python-dotenv
 streamlit
+pdfplumber
