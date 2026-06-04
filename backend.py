@@ -21,7 +21,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 
-MAX_PAPERS = 8000
+MAX_PAPERS = 50000
 DATA_FILE = Path(os.environ.get("ARXIV_DATA_FILE", "/root/.cache/kagglehub/datasets/Cornell-University/arxiv/versions/288/arxiv-metadata-oai-snapshot.json"))
 
 STOPWORDS = {
