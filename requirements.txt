@@ -8,3 +8,4 @@ peft
 tqdm
 kagglehub
 python-dotenv
+streamlit
