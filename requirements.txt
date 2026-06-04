@@ -10,3 +10,4 @@ kagglehub
 python-dotenv
 streamlit
 pdfplumber
+requests
