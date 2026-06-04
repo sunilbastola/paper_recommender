@@ -37,6 +37,14 @@ def _preprocess(text: str) -> str:
 
 def load_dataset():
     """Load arXiv papers and build all models needed by the 5 goals."""
+    import kagglehub
+
+    # Download dataset if not already cached
+    if not DATA_FILE.exists():
+        print("Downloading arXiv dataset from Kaggle...")
+        kagglehub.dataset_download("Cornell-University/arxiv")
+        print("Dataset downloaded and cached.")
+
     rows = []
     with DATA_FILE.open("r", encoding="utf-8") as f:
         for line in f:
