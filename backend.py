@@ -45,20 +45,20 @@ def load_dataset():
         kagglehub.dataset_download("Cornell-University/arxiv")
         print("Dataset downloaded and cached.")
 
-    rows = []
+    candidate_rows = []
+
     with DATA_FILE.open("r", encoding="utf-8") as f:
         for line in f:
             item = json.loads(line)
             cats = item.get("categories", "")
-            if any(c.startswith(("cs.", "stat.ML")) for c in cats.split()):
-                rows.append(item)
-            if len(rows) >= MAX_PAPERS:
-                break
 
-    df = pd.DataFrame(rows).sample(
-        n=min(MAX_PAPERS, len(rows)),
+            if any(c.startswith(("cs.", "stat.ML")) for c in cats.split()):
+                candidate_rows.append(item)
+
+    df = pd.DataFrame(candidate_rows).sample(
+        n=min(MAX_PAPERS, len(candidate_rows)),
         random_state=42
-    )
+    ).reset_index(drop=True)
     useful = ["id", "title", "authors", "abstract", "categories", "update_date"]
     df = df[[c for c in useful if c in df.columns]].dropna(
         subset=["title", "abstract", "categories"]
@@ -436,7 +436,7 @@ def recommend_papers(
 
     # Embedding retrieval: semantic matching using dense sentence embeddings.
     qvec = np.array(
-        embed_model.encode([query_clean], normalize_embeddings=True, convert_to_tensor=True).tolist(),
+        embed_model.encode([query], normalize_embeddings=True, convert_to_tensor=True).tolist(),
         dtype=np.float32,
     )
     dists, idxs = retriever.kneighbors(qvec, n_neighbors=top_k)
