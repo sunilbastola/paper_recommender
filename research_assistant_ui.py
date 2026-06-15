@@ -20,6 +20,11 @@ def get_backend():
     return load_dataset()
 
 
+# Load models immediately at startup so they are cached in Streamlit's process
+# before the first user request arrives. Without this, @st.cache_resource only
+# populates on the first request, causing a 2-3 minute cold-start delay.
+get_backend()
+
 for key, default in [
     ("chat_history", []),
     ("paper_text", ""),

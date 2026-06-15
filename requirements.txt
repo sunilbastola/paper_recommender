@@ -8,3 +8,7 @@ peft
 tqdm
 kagglehub
 python-dotenv
+streamlit
+pdfplumber
+requests
+torchvision

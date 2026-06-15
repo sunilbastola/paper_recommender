@@ -1,16 +1,18 @@
 import json
+import os
 import re
 import time
 from pathlib import Path
 
 import numpy as np  # must be imported before torch
-import os
+import pandas as pd
+import pdfplumber
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
-import requests
-import pandas as pd
-import pdfplumber
+
+import kagglehub
 from sentence_transformers import SentenceTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
@@ -19,8 +21,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 
-MAX_PAPERS = 8000
-DATA_FILE = Path("/Users/jocelyn/.cache/kagglehub/datasets/Cornell-University/arxiv/versions/288/arxiv-metadata-oai-snapshot.json")
+MAX_PAPERS = 50000
+DATA_FILE = Path(os.environ.get("ARXIV_DATA_FILE", "/root/.cache/kagglehub/datasets/Cornell-University/arxiv/versions/288/arxiv-metadata-oai-snapshot.json"))
 
 STOPWORDS = {
     "a","an","and","are","as","at","be","by","for","from","has","in","is",
@@ -37,6 +39,12 @@ def _preprocess(text: str) -> str:
 
 def load_dataset():
     """Load arXiv papers and build all models needed by the 5 goals."""
+    # Download dataset if not already cached
+    if not DATA_FILE.exists():
+        print("Downloading arXiv dataset from Kaggle...")
+        kagglehub.dataset_download("Cornell-University/arxiv")
+        print("Dataset downloaded and cached.")
+
     rows = []
     with DATA_FILE.open("r", encoding="utf-8") as f:
         for line in f:
@@ -47,7 +55,11 @@ def load_dataset():
             if len(rows) >= MAX_PAPERS:
                 break
 
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows).sample(
+        n=min(MAX_PAPERS, len(rows)),
+        random_state=42
+    ).reset_index(drop=True)
+    
     useful = ["id", "title", "authors", "abstract", "categories", "update_date"]
     df = df[[c for c in useful if c in df.columns]].dropna(
         subset=["title", "abstract", "categories"]
@@ -406,23 +418,56 @@ def recommend_papers(
     into the enriched context so the LLM can cross-reference both methods.
     """
 
-    query_vec  = tfidf_vec.transform([_preprocess(query)])
-    scores     = cosine_similarity(query_vec, tfidf_matrix).ravel()
-    top_idx    = scores.argsort()[-top_k:][::-1]
-    basic_recs = df.iloc[top_idx][["id", "title", "categories", "keywords"]].copy()
-    basic_recs["similarity"] = scores[top_idx]
-    tfidf_ids  = basic_recs["id"].tolist()
+    query_clean = _preprocess(query)
 
-    qvec        = np.array(embed_model.encode([query], normalize_embeddings=True, convert_to_tensor=True).tolist(), dtype=np.float32)
+    # TF-IDF candidate retrieval: exact keyword matching in the paper corpus.
+    query_vec = tfidf_vec.transform([query_clean])
+    if query_vec.nnz == 0:
+        basic_recs = df.iloc[[]][["id", "title", "categories", "keywords"]].copy()
+        basic_recs["similarity"] = np.array([], dtype=float)
+        tfidf_ids = []
+        tfidf_scores = {}
+    else:
+        scores = cosine_similarity(query_vec, tfidf_matrix).ravel()
+        top_idx = scores.argsort()[-top_k:][::-1]
+        basic_recs = df.iloc[top_idx][["id", "title", "categories", "keywords"]].copy()
+        basic_recs["similarity"] = scores[top_idx]
+        tfidf_ids = basic_recs["id"].tolist()
+        tfidf_scores = dict(zip(tfidf_ids, basic_recs["similarity"].tolist()))
+
+    # Embedding retrieval: semantic matching using dense sentence embeddings.
+    qvec = np.array(
+        embed_model.encode([query], normalize_embeddings=True, convert_to_tensor=True).tolist(),
+        dtype=np.float32,
+    )
     dists, idxs = retriever.kneighbors(qvec, n_neighbors=top_k)
-    advanced_results = df.iloc[idxs[0]].copy()
-    advanced_results["similarity"] = 1 - dists[0]
-    advanced_results = advanced_results[
+    embed_results = df.iloc[idxs[0]].copy()
+    embed_results["similarity"] = 1 - dists[0]
+    embed_scores = dict(zip(embed_results["id"].tolist(), embed_results["similarity"].tolist()))
+    embed_results = embed_results[
         ["id", "title", "authors", "categories", "keywords", "similarity", "abstract"]
     ]
 
-    enriched_ctx  = _build_enriched_context(query, advanced_results, tfidf_vec, terms, classifier)
-    assisted_ctx  = (
+    # Combine both candidate sets to reduce cases where one retriever misses relevant papers.
+    combined_ids = []
+    for rid in tfidf_ids:
+        if rid not in combined_ids:
+            combined_ids.append(rid)
+    for rid in embed_results["id"].tolist():
+        if rid not in combined_ids:
+            combined_ids.append(rid)
+
+    combined_results = df.set_index("id").loc[combined_ids].reset_index()
+    combined_results["similarity"] = combined_results["id"].map(embed_scores).fillna(
+        combined_results["id"].map(tfidf_scores)
+    ).fillna(0.0).astype(float)
+    combined_results = combined_results[
+        ["id", "title", "authors", "categories", "keywords", "similarity", "abstract"]
+    ]
+    combined_results = combined_results.sort_values(by="similarity", ascending=False).head(top_k)
+
+    enriched_ctx = _build_enriched_context(query, combined_results, tfidf_vec, terms, classifier)
+    assisted_ctx = (
         f"{enriched_ctx}\n\n"
         f"[Papers also flagged by TF-IDF keyword matching]\n"
         f"{', '.join(tfidf_ids)}"
@@ -434,7 +479,7 @@ def recommend_papers(
 
     return {
         "basic_recommendations":    basic_recs,
-        "advanced_recommendations": advanced_results,
+        "advanced_recommendations": combined_results,
         "llm_answer":               llm_answer,
     }
 
