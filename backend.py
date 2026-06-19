@@ -87,7 +87,7 @@ def load_dataset():
     df["primary_category"]  = df["categories"].str.split().str[0]
     df["clean_text"]        = df["paper_text"].map(_preprocess)
 
-
+    # Reuse one corpus-wide TF-IDF space for keyword extraction and sparse retrieval.
     tfidf_vec    = TfidfVectorizer(max_features=12000, ngram_range=(1, 2), min_df=3, max_df=0.75)
     tfidf_matrix = tfidf_vec.fit_transform(df["clean_text"])
     terms        = np.array(tfidf_vec.get_feature_names_out())
@@ -98,7 +98,8 @@ def load_dataset():
 
     df["keywords"] = [_top_kw(i) for i in range(len(df))]
 
-
+    # Train a lightweight domain classifier once so later prompts can be grounded
+    # with an inferred research area instead of relying on raw query wording alone.
     common_cats = df["primary_category"].value_counts().head(8).index
     clf_data    = df[df["primary_category"].isin(common_cats)]
     X_train, _, y_train, _ = train_test_split(
@@ -141,7 +142,7 @@ _MIN_CALL_INTERVAL = 13.0  # seconds between calls (free tier: 5 RPM = 12s minim
 
 def call_llm(system: str, messages: list[dict], model: str = "gemini-2.5-flash") -> str:
     global _last_llm_call
-    # Throttle: wait if last call was too recent
+    # Free-tier Gemini limits are tight, so we serialize calls with a minimum gap.
     elapsed = time.time() - _last_llm_call
     if elapsed < _MIN_CALL_INTERVAL:
         time.sleep(_MIN_CALL_INTERVAL - elapsed)
@@ -236,6 +237,8 @@ def generate_report(
     query_lower = query.lower()
     refers_to_paper = paper_text and any(p in query_lower for p in _paper_ref_phrases)
     query_has_topic = len(set(query_lower.split()) - _generic_rec_words) > 2
+    # If the user says "this paper" without a topic, use the uploaded content itself
+    # as the retrieval query so recommendations stay anchored to that document.
     search_query = paper_text[:1500] if (refers_to_paper or (paper_text and not query_has_topic)) else query
 
     rec = recommend_papers(
@@ -376,6 +379,8 @@ def summarise_findings(
 ) -> dict:
     if paper_text:
         basic_summary = _textrank_summary(paper_text, n=3)
+        # Feed the LLM a short extractive scaffold first so the final summary stays
+        # focused on salient sentences from the uploaded paper.
         prompt = (
             f"Summarise the following research paper.\n\n"
             f"[FORMAT]\n## Summary\n<3-4 sentences covering the main theme, methods, and key findings>\n\n"
@@ -426,6 +431,7 @@ def identify_research_gaps(
     vec      = tfidf_vec.transform([_preprocess(source_text)])
     row      = vec.toarray().ravel()
     query_kw = set(terms[row.argsort()[-20:][::-1]].tolist()) if row.sum() else set()
+    # The basic gap signal is "important in the domain but absent from the query/paper".
     basic_gaps = sorted(top_domain_kw - query_kw)[:10]
 
     if paper_text:
@@ -504,7 +510,8 @@ def recommend_papers(
         ["id", "title", "authors", "categories", "keywords", "similarity", "abstract"]
     ]
 
-    # Combine both candidate sets to reduce cases where one retriever misses relevant papers.
+    # Merge sparse and dense candidates so the downstream prompt sees both
+    # exact keyword matches and semantically close papers.
     combined_ids = []
     for rid in tfidf_ids:
         if rid not in combined_ids:
@@ -577,6 +584,7 @@ Reason: <one sentence why it is or isn't relevant>
     )
 
     scored = []
+    # Parse the strict block format back into structured recommendation data.
     for block in response.split("---"):
         block = block.strip()
         if not block:
@@ -630,6 +638,8 @@ def _build_enriched_context(
     terms: np.ndarray,
     classifier: Pipeline,
 ) -> str:
+    # Prefix the raw RAG context with lightweight signals the prompts can reliably
+    # use for grounding: predicted domain plus top TF-IDF keywords from the query.
     vec          = tfidf_vec.transform([_preprocess(query)])
     row          = vec.toarray().ravel()
     kw           = terms[row.argsort()[-8:][::-1]].tolist() if row.sum() else []
