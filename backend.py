@@ -1,8 +1,17 @@
 import json
+import logging
 import os
 import re
+import sys
 import time
 from pathlib import Path
+
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger(__name__)
+
+def _log(msg):
+    sys.stderr.write(f"[PAPERMIND] {msg}\n")
+    sys.stderr.flush()
 
 import numpy as np  # must be imported before torch
 import pandas as pd
@@ -21,8 +30,14 @@ from sklearn.model_selection import train_test_split
 from sklearn.neighbors import NearestNeighbors
 from sklearn.pipeline import Pipeline
 
-MAX_PAPERS = 50000
-DATA_FILE = Path(os.environ.get("ARXIV_DATA_FILE", "/root/.cache/kagglehub/datasets/Cornell-University/arxiv/versions/288/arxiv-metadata-oai-snapshot.json"))
+_log("backend.py imports complete")
+
+MAX_PAPERS = 8000
+DATA_FILE = Path(os.environ.get("ARXIV_DATA_FILE", str(Path.home() / ".cache/kagglehub/datasets/Cornell-University/arxiv/versions/288/arxiv-metadata-oai-snapshot.json")))
+CACHE_DIR = Path(__file__).parent / ".cache"
+EMBEDDINGS_CACHE = CACHE_DIR / f"embeddings_{MAX_PAPERS}.npy"
+PAPERS_CACHE = CACHE_DIR / f"papers_{MAX_PAPERS}.parquet"
+_log(f"DATA_FILE = {DATA_FILE}, exists = {DATA_FILE.exists()}")
 
 STOPWORDS = {
     "a","an","and","are","as","at","be","by","for","from","has","in","is",
@@ -45,6 +60,7 @@ def load_dataset():
         kagglehub.dataset_download("Cornell-University/arxiv")
         print("Dataset downloaded and cached.")
 
+    _log("Step 1: Reading dataset file...")
     rows = []
     with DATA_FILE.open("r", encoding="utf-8") as f:
         for line in f:
@@ -54,6 +70,7 @@ def load_dataset():
                 rows.append(item)
             if len(rows) >= MAX_PAPERS:
                 break
+    _log(f"Step 1 done: loaded {len(rows)} papers.")
 
     df = pd.DataFrame(rows).sample(
         n=min(MAX_PAPERS, len(rows)),
@@ -95,13 +112,24 @@ def load_dataset():
     classifier.fit(X_train, y_train)
 
 
+    _log("Step 3: Loading sentence-transformer model...")
     embed_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-    raw = embed_model.encode(
-        df["paper_text"].tolist(), batch_size=64,
-        show_progress_bar=False, normalize_embeddings=True,
-        convert_to_tensor=True,
-    )
-    embeddings = np.array(raw.tolist(), dtype=np.float32)
+
+    if EMBEDDINGS_CACHE.exists():
+        _log("Step 4: Loading cached embeddings (fast)...")
+        embeddings = np.load(str(EMBEDDINGS_CACHE))
+    else:
+        _log("Step 4: Encoding papers (first run, takes ~2 min)...")
+        CACHE_DIR.mkdir(exist_ok=True)
+        raw = embed_model.encode(
+            df["paper_text"].tolist(), batch_size=64,
+            show_progress_bar=True, normalize_embeddings=True,
+            convert_to_tensor=True,
+        )
+        embeddings = np.array(raw.tolist(), dtype=np.float32)
+        np.save(str(EMBEDDINGS_CACHE), embeddings)
+        _log("Step 4 done: embeddings saved to cache.")
+
     retriever = NearestNeighbors(n_neighbors=8, metric="cosine")
     retriever.fit(embeddings)
 
@@ -128,7 +156,7 @@ def call_llm(system: str, messages: list[dict], model: str = "gemini-2.5-flash")
         "system_instruction": {"parts": [{"text": system}]},
         "contents": contents,
     }
-    for attempt in range(3):
+    for attempt in range(4):
         _last_llm_call = time.time()
         response = requests.post(
             url,
@@ -136,11 +164,16 @@ def call_llm(system: str, messages: list[dict], model: str = "gemini-2.5-flash")
             json=body,
         )
         if response.status_code in (429, 503):
-            time.sleep(15 * (attempt + 1))
+            wait = 30 * (attempt + 1)  # 30s, 60s, 90s, 120s
+            _log(f"Rate limited (attempt {attempt+1}), retrying in {wait}s…")
+            time.sleep(wait)
             continue
         response.raise_for_status()
         return response.json()["candidates"][0]["content"]["parts"][0]["text"]
-    response.raise_for_status()
+    raise RuntimeError(
+        "Gemini API rate limit exceeded. Your free-tier daily quota may be exhausted. "
+        "Get a new key at https://aistudio.google.com/apikey and update .env."
+    )
 
 
 _INTENT_SYSTEM = """You are an intent classifier for an academic research assistant called Papermind.
@@ -167,7 +200,7 @@ Examples:
 
 
 def _classify_intent(query: str) -> set[str]:
-    """Ask Claude what the user wants. Returns a set of intent labels."""
+    """Classify the user's intent via Gemini. Returns a set of intent labels."""
     raw = call_llm(_INTENT_SYSTEM, [{"role": "user", "content": query}])
     return {label.strip().upper() for label in raw.split(",")}
 
@@ -185,8 +218,8 @@ def generate_report(
     retriever,
 ) -> dict:
     """
-    Sends the user's message to Claude to detect intent, then runs only the
-    matching function(s). Returns {"reply": str, "summary": str, "gaps": str, "recs": str}.
+    Detects the user's intent, then runs only the matching function(s).
+    Returns {"reply": str, "summary": str, "gaps": str, "recs": str}.
     """
     intents = _classify_intent(query)
 
@@ -198,10 +231,17 @@ def generate_report(
     # Clear all fields — only populate what was requested
     result = {"reply": "", "summary": "", "gaps": "", "recs": ""}
 
+    _paper_ref_phrases = {"this paper", "the paper", "uploaded", "attached", "referring to", "the document", "the file"}
+    _generic_rec_words = {"recommend", "paper", "similar", "related", "find", "show", "suggest", "other", "more", "what", "can", "you", "me", "please", "some", "any", "another", "give", "list", "papers"}
+    query_lower = query.lower()
+    refers_to_paper = paper_text and any(p in query_lower for p in _paper_ref_phrases)
+    query_has_topic = len(set(query_lower.split()) - _generic_rec_words) > 2
+    search_query = paper_text[:1500] if (refers_to_paper or (paper_text and not query_has_topic)) else query
+
     rec = recommend_papers(
-        query, df, tfidf_vec, tfidf_matrix, terms,
+        search_query, df, tfidf_vec, tfidf_matrix, terms,
         classifier, embed_model, retriever,
-        top_k=3 if paper_text else 4,
+        top_k=8 if paper_text else 4,
     )
 
     if paper_text:
@@ -237,10 +277,22 @@ def generate_report(
         actions.append("identified the research gaps")
 
     if wants_recs:
-        result["recs"] = "\n".join(
-            f"- **{r['title']}** ({r['categories']}) — {r['similarity']:.2f}"
-            for _, r in rec["advanced_recommendations"].iterrows()
-        )
+        if paper_text:
+            reranked = rerank_recommendations(paper_text, rec["advanced_recommendations"])
+            recs_data = reranked if reranked else [
+                {"id": r["id"], "title": r["title"], "authors": str(r.get("authors", "")),
+                 "categories": r["categories"], "similarity": float(r["similarity"]),
+                 "abstract": str(r.get("abstract", ""))[:400], "reason": ""}
+                for _, r in rec["advanced_recommendations"].iterrows()
+            ]
+        else:
+            recs_data = [
+                {"id": r["id"], "title": r["title"], "authors": str(r.get("authors", "")),
+                 "categories": r["categories"], "similarity": float(r["similarity"]),
+                 "abstract": str(r.get("abstract", ""))[:400], "reason": ""}
+                for _, r in rec["advanced_recommendations"].iterrows()
+            ]
+        result["recs"] = json.dumps(recs_data)
         actions.append("found relevant paper recommendations")
 
     if actions:
@@ -390,6 +442,10 @@ def identify_research_gaps(
         system="You are a research analyst.",
         messages=[{"role": "user", "content": _gap_cot_prompt(query, assisted_ctx)}],
     )
+    for marker in ("**Final Answer:**", "Final Answer:"):
+        if marker in advanced_gaps:
+            advanced_gaps = advanced_gaps.split(marker, 1)[1].strip()
+            break
 
     return {
         "domain":        query_domain,
@@ -482,6 +538,79 @@ def recommend_papers(
         "advanced_recommendations": combined_results,
         "llm_answer":               llm_answer,
     }
+
+
+def rerank_recommendations(
+    paper_text: str,
+    candidates: pd.DataFrame,
+) -> list[dict]:
+    """
+    Cross-reference function: re-ranks candidate papers by relevance to the
+    uploaded paper using Gemini scoring (0-10). Returns only papers scoring >= 5,
+    sorted by score descending.
+    """
+    candidate_blocks = "\n---\n".join(
+        f"Paper ID: {r['id']}\nTitle: {r['title']}\n"
+        f"Categories: {r['categories']}\nAbstract: {str(r.get('abstract', ''))[:400]}"
+        for _, r in candidates.iterrows()
+    )
+    prompt = f"""You are an expert academic relevance evaluator.
+
+Uploaded paper (excerpt):
+{paper_text[:1200]}
+
+For each candidate paper below, score its relevance to the uploaded paper from 0 to 10.
+Consider shared methodology, related topics, complementary findings, or directly citable work.
+
+Candidates:
+{candidate_blocks}
+
+Reply with ONLY this format for each paper (no extra text):
+Paper ID: <id>
+Score: <0-10>
+Reason: <one sentence why it is or isn't relevant>
+---"""
+
+    response = call_llm(
+        system="You are a precise academic relevance evaluator. Follow the output format exactly.",
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    scored = []
+    for block in response.split("---"):
+        block = block.strip()
+        if not block:
+            continue
+        lines = {}
+        for line in block.split("\n"):
+            if ":" in line:
+                key, _, val = line.partition(":")
+                lines[key.strip()] = val.strip()
+        paper_id = lines.get("Paper ID", "").strip()
+        reason = lines.get("Reason", "")
+        try:
+            score = float(lines.get("Score", "0"))
+        except ValueError:
+            score = 0.0
+        if paper_id and score >= 5:
+            scored.append({"id": paper_id, "score": score, "reason": reason})
+
+    scored.sort(key=lambda x: -x["score"])
+    score_map = {s["id"]: s for s in scored}
+
+    results = []
+    for _, r in candidates.iterrows():
+        if r["id"] in score_map:
+            results.append({
+                "id": r["id"],
+                "title": r["title"],
+                "authors": str(r.get("authors", "")),
+                "categories": r["categories"],
+                "similarity": score_map[r["id"]]["score"] / 10,
+                "abstract": str(r.get("abstract", ""))[:400],
+                "reason": score_map[r["id"]]["reason"],
+            })
+    return results
 
 
 def _textrank_summary(text: str, n: int = 2) -> str:

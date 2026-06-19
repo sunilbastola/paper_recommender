@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import streamlit as st
 from dotenv import load_dotenv
@@ -20,18 +21,12 @@ def get_backend():
     return load_dataset()
 
 
-# Load models immediately at startup so they are cached in Streamlit's process
-# before the first user request arrives. Without this, @st.cache_resource only
-# populates on the first request, causing a 2-3 minute cold-start delay.
 get_backend()
 
 for key, default in [
     ("chat_history", []),
-    ("paper_text", ""),
-    ("paper_name", ""),
-    ("result_summary", ""),
-    ("result_gaps", ""),
-    ("result_recs", ""),
+    ("papers", []),               # list of {"name": str, "text": str}
+    ("results_per_paper", []),    # list of {"name": str, "summary": str, "gaps": str, "recs": str}
     ("is_thinking", False),
     ("pending_query", ""),
 ]:
@@ -39,31 +34,56 @@ for key, default in [
         st.session_state[key] = default
 
 
+def _clear_results():
+    st.session_state.results_per_paper = []
+    st.session_state.chat_history = []
+
+
+def _render_paper_results(r: dict):
+    if r.get("summary"):
+        st.markdown("### 📋 Summary")
+        st.write(r["summary"])
+
+    if r.get("gaps"):
+        st.markdown("---")
+        st.markdown("### 🔍 Research Gaps")
+        st.write(r["gaps"])
+
+    if r.get("recs"):
+        st.markdown("---")
+        st.markdown("### 📚 Recommended Papers")
+        recs = json.loads(r["recs"])
+        with st.container(height=380):
+            for i, paper in enumerate(recs):
+                st.markdown(f"**{paper['title']}**")
+                st.caption(f"{paper['categories']} · Match: {paper['similarity']:.0%}")
+                if paper.get("authors"):
+                    st.caption(f"_{paper['authors'][:80]}_")
+                if paper.get("reason"):
+                    st.info(paper["reason"])
+                st.write(paper["abstract"][:250] + "…")
+                if i < len(recs) - 1:
+                    st.divider()
+
+
 st.title("I'm Papermind")
 
-
 left_col, right_col = st.columns([1, 1.2], gap="large")
-
 
 with left_col:
     st.markdown("### Chat with Papermind")
 
-    # Paper status bar
-    if st.session_state.paper_name:
+    # Paper status bar — one row per uploaded paper with individual remove
+    for i, paper in enumerate(st.session_state.papers):
         c1, c2 = st.columns([4, 1])
         with c1:
-            st.success(f"📄 **{st.session_state.paper_name}**")
+            st.success(f"📄 **{paper['name']}**")
         with c2:
-            if st.button("✕", use_container_width=True):
-                st.session_state.paper_text = ""
-                st.session_state.paper_name = ""
-                st.session_state.chat_history = []
-                st.session_state.result_summary = ""
-                st.session_state.result_gaps = ""
-                st.session_state.result_recs = ""
+            if st.button("✕", key=f"remove_{i}", use_container_width=True):
+                st.session_state.papers.pop(i)
+                _clear_results()
                 st.rerun()
 
-    # Chat messages display
     chat_box = st.container(height=420)
     with chat_box:
         if not st.session_state.chat_history:
@@ -85,29 +105,30 @@ with left_col:
             with st.chat_message("assistant", avatar="🧠"):
                 st.markdown("_Thinking…_")
 
-
     plus_col, form_col = st.columns([1, 11])
 
     with plus_col:
         with st.popover("＋", use_container_width=True):
-            st.markdown("**Upload a PDF paper**")
-            uploaded_inline = st.file_uploader(
+            st.markdown("**Upload PDF papers**")
+            uploaded_files = st.file_uploader(
                 "PDF",
                 type=["pdf"],
+                accept_multiple_files=True,
                 label_visibility="collapsed",
                 key="inline_uploader",
             )
-            if uploaded_inline:
-                if uploaded_inline.name != st.session_state.paper_name:
-                    with st.spinner("Extracting text…"):
-                        text = extract_pdf_text(uploaded_inline)
-                    st.session_state.paper_text = text[:5000]
-                    st.session_state.paper_name = uploaded_inline.name
-                    st.session_state.chat_history = []
-                    st.session_state.result_summary = ""
-                    st.session_state.result_gaps = ""
-                    st.session_state.result_recs = ""
-                st.success(f"✓ {st.session_state.paper_name}")
+            if uploaded_files:
+                existing_names = {p["name"] for p in st.session_state.papers}
+                new_files = [f for f in uploaded_files if f.name not in existing_names]
+                if new_files:
+                    for f in new_files:
+                        with st.spinner(f"Extracting {f.name}…"):
+                            text = extract_pdf_text(f)
+                        st.session_state.papers.append({"name": f.name, "text": text[:5000]})
+                    _clear_results()
+                    st.rerun()
+                for p in st.session_state.papers:
+                    st.success(f"✓ {p['name']}")
 
     with form_col:
         with st.form(key="chat_input_form", clear_on_submit=True):
@@ -116,69 +137,54 @@ with left_col:
 
 
 with right_col:
-    st.markdown("### About Papermind")
-    st.markdown("""
+    has_results = bool(
+        st.session_state.results_per_paper
+        and any(r.get("summary") or r.get("gaps") or r.get("recs")
+                for r in st.session_state.results_per_paper)
+    )
+
+    if not has_results:
+        st.markdown("### About Papermind")
+        st.markdown("""
 Papermind is an AI-powered academic research assistant built on the arXiv dataset.
 
 ---
 
 **📄 Analyse Academic Papers**
-Upload any research paper and Papermind will read and understand its content, identifying the core contributions, methodology, and findings.
+Upload any research paper and Papermind will read and understand its content.
 
 **🏷️ Extract Metadata**
-Automatically extracts structured information including authors, research domain, and key topics using TF-IDF keyword extraction and Named Entity Recognition.
+Automatically extracts authors, research domain, and key topics using TF-IDF and NER.
 
 **📋 Summarise Findings**
-Generates a concise, human-readable summary of a paper's main research direction and results — going beyond copying sentences to synthesising meaning.
+Generates a concise summary of a paper's main research direction and results.
 
 **🔍 Identify Research Gaps**
-Compares the paper's coverage against its research domain to surface topics and methods that are missing or underexplored.
+Surfaces topics and methods missing or underexplored compared to the research domain.
 
 **📚 Recommend Relevant Papers**
-Retrieves the most semantically relevant papers from the arXiv database using dense embeddings, then explains why each paper is a good match.
+Retrieves semantically relevant papers using dense embeddings.
 
 ---
 """)
+        if not st.session_state.papers:
+            st.info("No paper uploaded — questions will search the arXiv dataset.")
+    else:
+        results = st.session_state.results_per_paper
 
-    if not st.session_state.paper_name:
-        st.info("No paper uploaded — questions will search the arXiv dataset.")
+        if len(results) == 1:
+            _render_paper_results(results[0])
+        else:
+            tabs = st.tabs([r["name"] for r in results])
+            for tab, r in zip(tabs, results):
+                with tab:
+                    _render_paper_results(r)
 
     st.markdown("---")
     if st.button("Clear Chat", use_container_width=True):
-        st.session_state.chat_history = []
-        st.session_state.result_summary = ""
-        st.session_state.result_gaps = ""
-        st.session_state.result_recs = ""
+        _clear_results()
         st.rerun()
 
-st.markdown("---")
-st.markdown("### Analysis Results")
-
-if st.session_state.result_summary or st.session_state.result_gaps or st.session_state.result_recs:
-    res_col1, res_col2, res_col3 = st.columns(3, gap="medium")
-
-    with res_col1:
-        st.markdown("#### 📋 Summary")
-        if st.session_state.result_summary:
-            st.write(st.session_state.result_summary)
-        else:
-            st.caption("No summary yet.")
-
-    with res_col2:
-        st.markdown("#### 🔍 Research Gaps")
-        if st.session_state.result_gaps:
-            st.write(st.session_state.result_gaps)
-        else:
-            st.caption("No gaps identified yet.")
-
-    with res_col3:
-        st.markdown("#### 📚 Recommended Papers")
-        if st.session_state.result_recs:
-            st.write(st.session_state.result_recs)
-        else:
-            st.caption("No recommendations yet.")
-else:
-    st.write("Analysis results will appear here once you ask a question.")
 
 if send and user_input.strip():
     st.session_state.chat_history.append({"role": "user", "content": user_input.strip()})
@@ -201,19 +207,40 @@ if st.session_state.is_thinking:
     try:
         df, tfidf_vec, tfidf_matrix, terms, classifier, embed_model, retriever = get_backend()
 
-        report = generate_report(
-            query,
-            st.session_state.paper_text,
-            st.session_state.paper_name,
-            df, tfidf_vec, tfidf_matrix, terms, classifier, embed_model, retriever,
-        )
+        if st.session_state.papers:
+            all_results = []
+            reply_parts = []
+            for paper in st.session_state.papers:
+                report = generate_report(
+                    query,
+                    paper["text"],
+                    paper["name"],
+                    df, tfidf_vec, tfidf_matrix, terms, classifier, embed_model, retriever,
+                )
+                all_results.append({
+                    "name": paper["name"],
+                    "summary": report["summary"],
+                    "gaps":    report["gaps"],
+                    "recs":    report["recs"],
+                })
+                if report["reply"]:
+                    reply_parts.append(f"**{paper['name']}:** {report['reply']}")
+            st.session_state.results_per_paper = all_results
+            reply_text = "\n\n".join(reply_parts) if reply_parts else "Done. See results on the right."
+        else:
+            report = generate_report(
+                query, "", "",
+                df, tfidf_vec, tfidf_matrix, terms, classifier, embed_model, retriever,
+            )
+            st.session_state.results_per_paper = [{
+                "name": "",
+                "summary": report["summary"],
+                "gaps":    report["gaps"],
+                "recs":    report["recs"],
+            }]
+            reply_text = report["reply"]
 
-        st.session_state.result_summary = report["summary"]
-        st.session_state.result_gaps    = report["gaps"]
-        st.session_state.result_recs    = report["recs"]
-        st.session_state.chat_history.append({"role": "assistant", "content": report["reply"]})
-
-
+        st.session_state.chat_history.append({"role": "assistant", "content": reply_text})
 
     except Exception as e:
         st.session_state.chat_history.append({
